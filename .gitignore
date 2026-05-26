@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.idea/
+.vscode/
+build/
+dist/
+*.exe
+*.dll
+*.lnk
+*.log
