@@ -7,10 +7,101 @@ from pathlib import Path
 import fitz  # PyMuPDF，用于处理PDF读取
 
 # --- 定义图片支持格式 ---
-SUPPORTED_FORMATS = {
-    "JPG": ".jpg", "PNG": ".png", "BMP": ".bmp", "TIFF": ".tif",
-    "WEBP": ".webp", "GIF": ".gif", "ICO": ".ico"
+FORMAT_OPTIONS = {
+    "JPG": {"default_ext": ".jpg", "extensions": (".jpg", ".jpeg"), "save_format": "JPEG"},
+    "PNG": {"default_ext": ".png", "extensions": (".png",), "save_format": "PNG"},
+    "BMP": {"default_ext": ".bmp", "extensions": (".bmp",), "save_format": "BMP"},
+    "TIFF": {"default_ext": ".tif", "extensions": (".tif", ".tiff"), "save_format": "TIFF"},
+    "WEBP": {"default_ext": ".webp", "extensions": (".webp",), "save_format": "WEBP"},
+    "GIF": {"default_ext": ".gif", "extensions": (".gif",), "save_format": "GIF"},
+    "ICO": {"default_ext": ".ico", "extensions": (".ico",), "save_format": "ICO"},
 }
+SUPPORTED_FORMATS = {name: info["default_ext"] for name, info in FORMAT_OPTIONS.items()}
+SUPPORTED_EXTENSIONS = tuple(sorted({ext for info in FORMAT_OPTIONS.values() for ext in info["extensions"]}))
+IMAGE_FILE_PATTERN = ";".join(f"*{ext}" for ext in SUPPORTED_EXTENSIONS)
+
+
+def validate_int(value, minimum, maximum, label):
+    try:
+        number = int(str(value).strip())
+    except ValueError as exc:
+        raise ValueError(f"{label} 必须是 {minimum}-{maximum} 的整数") from exc
+    if number < minimum or number > maximum:
+        raise ValueError(f"{label} 必须是 {minimum}-{maximum} 的整数")
+    return number
+
+
+def is_supported_image(path):
+    return path.suffix.lower() in SUPPORTED_EXTENSIONS
+
+
+def make_unique_path(path):
+    if not path.exists():
+        return path
+    for counter in range(1, 10000):
+        candidate = path.with_name(f"{path.stem}_{counter}{path.suffix}")
+        if not candidate.exists():
+            return candidate
+    raise FileExistsError(f"无法生成不重名文件: {path}")
+
+
+def image_has_transparency(img):
+    return img.mode in ("RGBA", "LA") or (img.mode == "P" and "transparency" in img.info)
+
+
+def prepare_image_for_target(img, target_fmt):
+    img.load()
+    if target_fmt in ("JPG", "BMP"):
+        if image_has_transparency(img):
+            rgba = img.convert("RGBA")
+            background = Image.new("RGB", rgba.size, (255, 255, 255))
+            background.paste(rgba, mask=rgba.getchannel("A"))
+            rgba.close()
+            return background
+        if img.mode != "RGB":
+            return img.convert("RGB")
+        return img.copy()
+    if target_fmt == "ICO" and img.mode not in ("RGB", "RGBA"):
+        return img.convert("RGBA")
+    return img.copy()
+
+
+def get_save_kwargs(target_fmt, quality):
+    kwargs = {}
+    if target_fmt in ("JPG", "WEBP"):
+        kwargs["quality"] = quality
+    if target_fmt == "JPG":
+        kwargs["optimize"] = True
+    if target_fmt == "PNG":
+        kwargs["optimize"] = True
+    return kwargs
+
+
+def save_converted_image(src, dst, target_fmt, quality):
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    save_format = FORMAT_OPTIONS[target_fmt]["save_format"]
+    temp_path = None
+    try:
+        with Image.open(src) as img:
+            converted = prepare_image_for_target(img, target_fmt)
+            try:
+                save_kwargs = get_save_kwargs(target_fmt, quality)
+                if src.resolve() == dst.resolve():
+                    temp_path = make_unique_path(dst.with_name(f".{dst.stem}.tmp{dst.suffix}"))
+                    converted.save(temp_path, save_format, **save_kwargs)
+                    os.replace(temp_path, dst)
+                    temp_path = None
+                else:
+                    converted.save(dst, save_format, **save_kwargs)
+            finally:
+                converted.close()
+    finally:
+        if temp_path and temp_path.exists():
+            try:
+                temp_path.unlink()
+            except OSError:
+                pass
+
 
 class UniversalConverterApp:
     def __init__(self, root):
@@ -18,6 +109,7 @@ class UniversalConverterApp:
         # --- 这里修改了软件名称 ---
         self.root.title("全能格式工厂 (图片 + PDF) ZXQ") 
         self.root.geometry("750x650")
+        self.root.minsize(720, 600)
 
         # 创建选项卡控件 (Notebook)
         self.notebook = ttk.Notebook(root)
@@ -44,6 +136,8 @@ class UniversalConverterApp:
         tk.Button(top_frame, text="打开图片文件夹", command=self.select_img_folder).pack(side="left")
         self.lbl_img_path = tk.Label(top_frame, text="未选择", fg="gray")
         self.lbl_img_path.pack(side="left", padx=10)
+        self.img_recursive_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(top_frame, text="包含子文件夹", variable=self.img_recursive_var, command=self.refresh_img_list).pack(side="left")
 
         # 2. 列表
         list_frame = tk.Frame(self.tab_img)
@@ -123,10 +217,42 @@ class UniversalConverterApp:
         # 扫描所有支持的图片
         if not self.img_current_folder:
             return
-        for f in self.img_current_folder.iterdir():
-            if f.is_file() and f.suffix.lower() in SUPPORTED_FORMATS.values():
-                self.img_files_map.append(f)
-                self.img_listbox.insert(tk.END, f.name)
+        try:
+            iterator = self.img_current_folder.rglob("*") if self.img_recursive_var.get() else self.img_current_folder.iterdir()
+            files = [f for f in iterator if f.is_file() and is_supported_image(f)]
+        except OSError as exc:
+            messagebox.showerror("错误", f"读取文件夹失败:\n{exc}")
+            return
+
+        files.sort(key=lambda p: str(p.relative_to(self.img_current_folder)).lower())
+        for f in files:
+            display_name = str(f.relative_to(self.img_current_folder)) if self.img_recursive_var.get() else f.name
+            self.img_files_map.append(f)
+            self.img_listbox.insert(tk.END, display_name)
+        self.img_status_var.set(f"已加载 {len(files)} 张图片")
+
+    def get_img_display_path(self, path):
+        try:
+            return str(path.relative_to(self.img_current_folder))
+        except (TypeError, ValueError):
+            return path.name
+
+    def build_img_destination(self, src, target_ext, output_base_dir):
+        if self.img_output_mode.get() == "same":
+            output_dir = src.parent
+        else:
+            output_dir = output_base_dir
+            if self.img_recursive_var.get() and self.img_current_folder:
+                try:
+                    output_dir = output_dir / src.parent.relative_to(self.img_current_folder)
+                except ValueError:
+                    pass
+
+        suffix = "" if self.img_overwrite_var.get() else (self.img_suffix_var.get().strip() or "_converted")
+        dst = output_dir / f"{src.stem}{suffix}{target_ext}"
+        if not self.img_overwrite_var.get():
+            dst = make_unique_path(dst)
+        return dst
 
     def select_all_images(self):
         if self.img_listbox.size() > 0:
@@ -163,49 +289,52 @@ class UniversalConverterApp:
         if not output_dir:
             messagebox.showwarning("提示", "请先选择输出目录")
             return
-        output_dir.mkdir(parents=True, exist_ok=True)
 
-        target_ext = SUPPORTED_FORMATS[self.img_target_combo.get()]
         target_fmt = self.img_target_combo.get()
+        target_ext = FORMAT_OPTIONS[target_fmt]["default_ext"]
+        try:
+            quality = validate_int(self.img_quality_var.get(), 1, 100, "质量")
+        except ValueError as exc:
+            messagebox.showwarning("提示", str(exc))
+            return
+
+        if self.img_output_mode.get() == "custom":
+            try:
+                output_dir.mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                messagebox.showerror("错误", f"创建输出目录失败:\n{exc}")
+                return
+
         success = 0
         failed = 0
+        errors = []
         self.img_progress["maximum"] = len(indices)
         self.img_progress["value"] = 0
         self.img_status_var.set("正在转换...")
-
-        try:
-            quality = int(self.img_quality_var.get().strip())
-            if quality < 1 or quality > 100:
-                raise ValueError
-        except ValueError:
-            messagebox.showwarning("提示", "质量必须是 1-100 的整数")
-            return
         
         for step, index in enumerate(indices, start=1):
             src = self.img_files_map[index]
-            if self.img_overwrite_var.get():
-                dst = output_dir / f"{src.stem}{target_ext}"
-            else:
-                suffix = self.img_suffix_var.get().strip() or "_converted"
-                dst = output_dir / f"{src.stem}{suffix}{target_ext}"
+            dst = self.build_img_destination(src, target_ext, output_dir)
+            display_name = self.get_img_display_path(src)
+            self.img_status_var.set(f"正在转换 {step}/{len(indices)}: {display_name}")
             try:
-                with Image.open(src) as img:
-                    if target_fmt in ("JPG", "BMP"):
-                        if img.mode != "RGB":
-                            img = img.convert("RGB")
-                    save_kwargs = {}
-                    if target_fmt in ("JPG", "WEBP"):
-                        save_kwargs["quality"] = quality
-                    img.save(dst, **save_kwargs)
-                    success += 1
-            except Exception as e:
+                save_converted_image(src, dst, target_fmt, quality)
+                success += 1
+            except Exception as exc:
                 failed += 1
-                print(e)
+                errors.append(f"{display_name}: {exc}")
             self.img_progress["value"] = step
             self.root.update_idletasks()
         
         self.img_status_var.set("转换完成")
-        messagebox.showinfo("完成", f"成功转换 {success} 张图片，失败 {failed} 张")
+        summary = f"成功转换 {success} 张图片，失败 {failed} 张"
+        if errors:
+            detail = "\n".join(errors[:8])
+            if len(errors) > 8:
+                detail += f"\n... 还有 {len(errors) - 8} 条失败记录"
+            messagebox.showwarning("完成", f"{summary}\n\n失败明细:\n{detail}")
+        else:
+            messagebox.showinfo("完成", summary)
 
     # ============================================================
     # 模块 2：PDF 工具箱
@@ -261,7 +390,7 @@ class UniversalConverterApp:
         # 1. 多选图片
         file_paths = filedialog.askopenfilenames(
             title="选择要合并的图片 (按住Ctrl多选)",
-            filetypes=[("Image Files", "*.jpg;*.png;*.bmp;*.tif")]
+            filetypes=[("Image Files", IMAGE_FILE_PATTERN), ("All Files", "*.*")]
         )
         if not file_paths: return
         if self.pdf_sort_var.get():
@@ -277,28 +406,29 @@ class UniversalConverterApp:
 
         try:
             try:
-                dpi = int(self.pdf_dpi_var.get().strip())
-                if dpi < 72 or dpi > 600:
-                    raise ValueError
-            except ValueError:
-                messagebox.showwarning("提示", "DPI 必须是 72-600 的整数")
+                dpi = validate_int(self.pdf_dpi_var.get(), 72, 600, "DPI")
+            except ValueError as exc:
+                messagebox.showwarning("提示", str(exc))
                 return
 
             # 核心逻辑：Pillow 列表保存
-            img_list = []
-            first_img = None
-            
-            for p in file_paths:
-                img = Image.open(p)
-                if img.mode != 'RGB': img = img.convert('RGB')
-                
-                if first_img is None:
-                    first_img = img
+            pdf_images = []
+            try:
+                for p in file_paths:
+                    with Image.open(p) as img:
+                        pdf_images.append(prepare_image_for_target(img, "JPG"))
+
+                if pdf_images:
+                    first_img = pdf_images[0]
+                    first_img.save(save_path, "PDF", resolution=float(dpi), save_all=True, append_images=pdf_images[1:])
                 else:
-                    img_list.append(img)
-            
-            if first_img:
-                first_img.save(save_path, "PDF", resolution=float(dpi), save_all=True, append_images=img_list)
+                    messagebox.showwarning("提示", "未读取到可合并的图片")
+                    return
+            finally:
+                for img in pdf_images:
+                    img.close()
+
+            if pdf_images:
                 messagebox.showinfo("成功", f"PDF 已生成！\n路径: {save_path}")
             
         except Exception as e:
@@ -310,50 +440,47 @@ class UniversalConverterApp:
         if not pdf_path: return
 
         pdf_path = Path(pdf_path)
+        try:
+            dpi = validate_int(self.pdf_img_dpi_var.get(), 72, 600, "DPI")
+        except ValueError as exc:
+            messagebox.showwarning("提示", str(exc))
+            return
+
         custom_out = self.pdf_out_var.get().strip()
         output_folder = Path(custom_out) if custom_out else (pdf_path.parent / f"{pdf_path.stem}_images")
-        output_folder.mkdir(parents=True, exist_ok=True)
 
         self.pdf_status.config(text="正在拆解 PDF...")
         self.root.update()
 
         try:
-            doc = fitz.open(pdf_path)
-            total_pages = len(doc)
-            try:
-                page_indices = self.parse_page_range(self.pdf_range_var.get(), total_pages)
-            except ValueError:
-                messagebox.showwarning("提示", "页码范围格式错误，例如: 1-3,5,7-9")
-                return
-            if not page_indices:
-                messagebox.showwarning("提示", "未匹配到可导出的页码")
-                return
-            try:
-                dpi = int(self.pdf_img_dpi_var.get().strip())
-                if dpi < 72 or dpi > 600:
-                    raise ValueError
-            except ValueError:
-                messagebox.showwarning("提示", "DPI 必须是 72-600 的整数")
-                return
+            with fitz.open(pdf_path) as doc:
+                total_pages = len(doc)
+                try:
+                    page_indices = self.parse_page_range(self.pdf_range_var.get(), total_pages)
+                except ValueError:
+                    messagebox.showwarning("提示", "页码范围格式错误，例如: 1-3,5,7-9")
+                    return
+                if not page_indices:
+                    messagebox.showwarning("提示", "未匹配到可导出的页码")
+                    return
 
-            scale = dpi / 72.0
-            matrix = fitz.Matrix(scale, scale)
-            out_fmt = self.pdf_img_fmt.get()
-            ext = ".png" if out_fmt == "PNG" else ".jpg"
-            self.pdf_progress["maximum"] = len(page_indices)
-            self.pdf_progress["value"] = 0
+                output_folder.mkdir(parents=True, exist_ok=True)
+                scale = dpi / 72.0
+                matrix = fitz.Matrix(scale, scale)
+                out_fmt = self.pdf_img_fmt.get()
+                ext = ".png" if out_fmt == "PNG" else ".jpg"
+                self.pdf_progress["maximum"] = len(page_indices)
+                self.pdf_progress["value"] = 0
 
-            for idx, page_no in enumerate(page_indices, start=1):
-                page = doc.load_page(page_no)
-                pix = page.get_pixmap(matrix=matrix)
-                if out_fmt == "JPG" and pix.alpha:
-                    pix = fitz.Pixmap(pix, 0)
-                output_file = output_folder / f"page_{page_no+1:03d}{ext}"
-                pix.save(str(output_file))
-                
-                self.pdf_status.config(text=f"正在导出第 {page_no+1} 页...")
-                self.pdf_progress["value"] = idx
-                self.root.update_idletasks()
+                for idx, page_no in enumerate(page_indices, start=1):
+                    page = doc.load_page(page_no)
+                    pix = page.get_pixmap(matrix=matrix, alpha=False)
+                    output_file = output_folder / f"page_{page_no+1:03d}{ext}"
+                    pix.save(str(output_file))
+
+                    self.pdf_status.config(text=f"正在导出第 {page_no+1} 页...")
+                    self.pdf_progress["value"] = idx
+                    self.root.update_idletasks()
 
             messagebox.showinfo("成功", f"拆解完成！\n图片保存在文件夹:\n{output_folder}")
             self.pdf_status.config(text="PDF工具准备就绪")
@@ -375,23 +502,29 @@ class UniversalConverterApp:
             return list(range(total_pages))
 
         pages = set()
-        parts = re.split(r"[，,]+", text)
+        parts = re.split(r"[，,；;]+", text)
         for part in parts:
             part = part.strip()
             if not part:
                 continue
+            part = re.sub(r"[–—~～－]", "-", part)
             if "-" in part:
                 left, right = part.split("-", 1)
                 left = left.strip()
                 right = right.strip()
                 start = int(left) if left else 1
                 end = int(right) if right else total_pages
+                if start < 1 or end < 1:
+                    raise ValueError
                 if start > end:
                     start, end = end, start
                 for p in range(start, end + 1):
                     pages.add(p)
             else:
-                pages.add(int(part))
+                page = int(part)
+                if page < 1:
+                    raise ValueError
+                pages.add(page)
 
         valid = [p for p in pages if 1 <= p <= total_pages]
         return sorted([p - 1 for p in valid])
